@@ -29,24 +29,28 @@
 // IDA libs
 #define USE_DANGEROUS_FUNCTIONS
 #define USE_STANDARD_FILE_FUNCTIONS
+#define NO_OBSOLETE_FUNCS
+#pragma warning(push)
+#pragma warning(disable:4244)
+#pragma warning(disable:4267)
 #include <ida.hpp>
 #include <auto.hpp>
 #include <loader.hpp>
 #include <search.hpp>
-#pragma warning(push)
-#pragma warning(disable:4267) // "conversion from 'size_t' to 'xxx', possible loss of data"
 #include <typeinf.hpp>
-#pragma warning(pop)
 #include <struct.hpp>
 #include <nalt.hpp>
 #include <demangle.hpp>
+#pragma warning(pop)
 
-#include "AlignNewDelete.h"
 #include "Utility.h"
-#include "EZHeapAlloc.h"
+
+// Helper in replacing the old custom allocators
+template <typename _Ty> _Ty *TAlloc(size_t Elements) { return((_Ty *) malloc(Elements * sizeof(_Ty))); }
+template <typename _Ty> _Ty *TRealloc(_Ty *lpMem, size_t Elements) { return((_Ty *) realloc((PVOID) lpMem, Elements * sizeof(_Ty))); }
 
 #define XML_STATIC 1
 #include <expat.h>
 
-#define MY_VERSION MAKEWORD(5, 1) // Low, high, convention: 0 to 99
+#define MY_VERSION MAKEWORD(6, 1) // Low, high, convention: 0 to 99
 

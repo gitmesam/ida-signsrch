@@ -21,7 +21,7 @@ static int SearchSmallpat(PBYTE pSrc, int iSrcLen, PBYTE  pPattern, int iPattern
 	for(PBYTE p = pSrc; p <= pLimit; p++)
 	{
 		if(!memcmp(p, pPattern, iPatternLen))
-			return(p - pSrc);
+			return (int) (p - pSrc);
 	}
 
 	return(-1);
@@ -129,7 +129,8 @@ static int  iPatternBacktrackSize = 0;
 // Clean up pattern search data
 void clearPatternSearchData()
 {
-	if(piPatternBacktrack) Heap().Free(piPatternBacktrack);
+	if(piPatternBacktrack)
+		free(piPatternBacktrack);
 	piPatternBacktrack    = NULL;
 	iPatternBacktrackSize = 0;
 }
@@ -196,11 +197,11 @@ UINT patternSearch(PBYTE pSrc, int iSrcLen, PBYTE pPattern, int iPatternLen, int
 				break;
 
 			pStart = (pPatStart + iSlicesize);
-			iRemaining = (iSrcLen - (pStart - pSrc));
+			iRemaining = (iSrcLen - (int) (pStart - pSrc));
 			p = pPattern;
 			pPatStart = NULL;
 		}
 	}
 
-	return((iOfs != -1) ? (pPatStart - pSrc) : (UINT) -1);
+	return((iOfs != -1) ? (UINT) (pPatStart - pSrc) : (UINT) -1);
 }

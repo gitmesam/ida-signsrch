@@ -1,15 +1,10 @@
 
-// ****************************************************************************
-// File: Main.cpp
-// Desc: Plugin main
-// Auth: Sirmabus 2012
-//
-// ****************************************************************************
+// IDA Signsrch plug-in
+// By Sirmabus
 #include "stdafx.h"
 #include <WaitBoxEx.h>
 
-// Signature container
-#pragma pack(push, 1)
+// Signature list container
 typedef struct _SIG
 {
 	LPSTR title;
@@ -18,73 +13,67 @@ typedef struct _SIG
 	WORD  bits;
 	WORD  flags;
 } SIG, *LPSIG;
-#pragma pack(pop)
-typedef std::vector<SIG, EZHeapAlloc<SIG>> SIGLIST;
+typedef std::vector<SIG> SIGLIST;
 
-// Match container
+// SIG.flags
+const WORD BIGENDIAN = (1 << 0); // 0 = little endian, 1 = big endian
+const WORD REVERSE   = (1 << 1); // Reverse/reflect
+const WORD AND	     = (1 << 2); // And bits
+
+// Match list container
 typedef struct _MATCH
 {
 	ea_t address;
 	UINT index;
 	bool operator()(_MATCH const &a, _MATCH const &b){ return(a.address < b.address); }
 } MATCH, *LPMATCH;
-typedef std::vector<MATCH, EZHeapAlloc<MATCH>> MATCHLIST;
-
-// wFlag defs
-const WORD BIGENDIAN = (1 << 0); // 0 = little endian, 1 = big endian ** Don't change, this must be '1' **
-const WORD REVERSE   = (1 << 1); // Reverse/reflect
-const WORD AND       = (1 << 2); // And bits
+typedef std::vector<MATCH> MATCHLIST;
 
 #define SIGFILE "signsrch.xml"
 
-// === Function Prototypes ===
-static int idaapi pluginInit();
-static void idaapi pluginTerm();
-static void idaapi pluginRun(int arg);
+static int idaapi init();
+static void idaapi term();
+static bool idaapi run(size_t arg);
 static void freeSignatureData();
 static void clearProcessSegmentBuffer();
 extern void clearPatternSearchData();
 static void clearMatchData();
 
-// === Data ===
-static const char PLUGIN_NAME[] = "Signsrch";
-
-ALIGN(16) static SIGLIST   sigList;
-ALIGN(16) static MATCHLIST matchList;
+ static SIGLIST   sigList;
+ static MATCHLIST matchList;
 
 static HMODULE myModule = NULL;
 static int  iconID = -1;
 static UINT sigDataBytes = 0;
 static UINT totalMatches = 0;
-static BOOL listWindowUp = FALSE;
+static BOOL listChooserUp = FALSE;
 
 // UI options bit flags
-// *** Must be same sequence as check box options
-static SBITFLAG BitF;
-const static WORD OPT_ALTENDIAN  = BitF.Next();
-const static WORD OPT_DEBUGOUT   = BitF.Next();
-const static WORD OPT_CODESEGS   = BitF.Next();
-const static WORD OPT_COMMENTS   = BitF.Next();
+// * Must be same sequence as check box options
+const static WORD OPT_ALTENDIAN  = (1 << 0);
+const static WORD OPT_DEBUGOUT   = (1 << 1);
+const static WORD OPT_CODESEGS   = (1 << 2);
+const static WORD OPT_COMMENTS   = (1 << 3);
 static BOOL altEndianSearch     = FALSE;
 static BOOL debugOutput	        = FALSE;
 static BOOL includeCodeSegments = TRUE;
 static BOOL placeComments       = TRUE;
 
 // Plug-in description block
-extern "C" ALIGN(16) plugin_t PLUGIN =
+__declspec(dllexport) plugin_t PLUGIN =
 {
 	IDP_INTERFACE_VERSION,
 	PLUGIN_PROC,
-	pluginInit,
-	pluginTerm,
-	pluginRun,
-    PLUGIN_NAME,
+	init,
+	term,
+	run,
+	"Signsrch: A plug-in of conversion Auriemma's signsrch signature matching tool.",
 	" ",
-	PLUGIN_NAME,
+	"Signsrch",
 	NULL
 };
 
-ALIGN(16) static const char mainForm[] =
+ static const char mainForm[] =
 {
 	"BUTTON YES* Continue\n" // 'Continue' instead of 'okay'
 
@@ -108,8 +97,8 @@ ALIGN(16) static const char mainForm[] =
 	"<#Automatically place label comments for located signatures.#Place signature comments. :C>>\n"
 
 	// * Maintain button names hard coded in "HelpURL.h"
-	"<#Click to open plugin support page.#Macromonkey forum:k:2:16::>   "
-	"<#Click to open Luigi Auriemma's Signsrch page.#Luigi Signsrch page:k:2:16::>\n \n "
+	"<#Click to open plugin support page.#Macromonkey:k:2:16::>   "
+	"<#Click to open Luigi Auriemma's Signsrch page.#Luigi's Signsrch:k:2:16::>\n \n "
 };
 
 // Custom chooser icon
@@ -131,17 +120,13 @@ static const BYTE iconData[] =
 
 
 // ======================================================================================
-static int idaapi pluginInit()
+static int idaapi init()
 {
-	// SIG struct should be align 16
-	C_ASSERT((sizeof(SIG) & (16-1)) == 0);
-
-	listWindowUp = FALSE;
+	listChooserUp = FALSE;
 	return(PLUGIN_OK);
 }
 
-// ======================================================================================
-static void idaapi pluginTerm()
+static void idaapi term()
 {
     if (iconID != -1)
     {
@@ -149,13 +134,21 @@ static void idaapi pluginTerm()
         iconID = -1;
     }
 
-	// Just in case..
 	clearMatchData();
 	clearPatternSearchData();
 	freeSignatureData();
 }
 
 // ======================================================================================
+
+static LPSTR replaceNameInPath(LPSTR pszPath, LPSTR pszNewName)
+{
+	char szDrive[_MAX_DRIVE];
+	char szDir[_MAX_DIR];
+	_splitpath(pszPath, szDrive, szDir, NULL, NULL);
+	_makepath(pszPath, szDrive, szDir, pszNewName, NULL);
+	return(pszPath);
+}
 
 // Load signature XML file
 static LPSTR xmlValueStr = NULL;
@@ -189,8 +182,8 @@ static void XMLCALL characterHandler(PVOID parm, LPCSTR dataStr, int len)
 	}
 	CATCH();
 }
-//
-ALIGN(16) static char titleStr[1024] = {0};
+
+ static char titleStr[1024] = {0};
 static void XMLCALL startElement(PVOID parm, LPCTSTR nameStr, LPCTSTR *attribStr)
 {
 	try
@@ -214,7 +207,7 @@ static void XMLCALL startElement(PVOID parm, LPCTSTR nameStr, LPCTSTR *attribStr
 	}
 	CATCH();
 }
-//
+
 static void XMLCALL endElement(PVOID parm, LPCSTR name)
 {
 	try
@@ -224,8 +217,8 @@ static void XMLCALL endElement(PVOID parm, LPCSTR name)
 			if(*((PWORD) name) == MAKEWORD('p',0))
 			{
 				STACKALIGN(sig, SIG);
-				sig.title = Heap().strdup(titleStr);
-				sig.data    = NULL;
+				sig.title = _strdup(titleStr);
+				sig.data = NULL;
 
 				if(sig.title)
 				{
@@ -242,7 +235,7 @@ static void XMLCALL endElement(PVOID parm, LPCSTR name)
 					if(lastBrace)
 					{
 						// Largest section seen is 16 chars
-						int len = strlen(++lastBrace);
+						int len = (int) strlen(++lastBrace);
 						lastBrace[len - 1] = 0;
 
 						// And flag?
@@ -295,7 +288,7 @@ static void XMLCALL endElement(PVOID parm, LPCSTR name)
 										sig.flags = BIGENDIAN;
 
 									// Bail out if altEndianSearch off and opposite our endian
-                                    if (!altEndianSearch && ((BYTE) inf.mf != (BYTE)sig.flags))
+									if (!altEndianSearch && (inf.is_be() != (bool) (sig.flags & BIGENDIAN)))
 									{
 										//msg("B: \"%s\"\n", sig.title);
 										endianBail = TRUE;
@@ -318,7 +311,7 @@ static void XMLCALL endElement(PVOID parm, LPCSTR name)
 										++steps;
 
 										// Signature string to bytes
-										sig.data = (PBYTE) Heap().Alloc(sig.size);
+										sig.data = (PBYTE) malloc(sig.size);
 										if(sig.data)
 										{
 											// Hex string to byte data
@@ -342,7 +335,7 @@ static void XMLCALL endElement(PVOID parm, LPCSTR name)
 											//if(uSize == 0)
 											{
 												++steps;
-												sigDataBytes += strlen(sig.title);
+												sigDataBytes += (UINT) strlen(sig.title);
 												sigDataBytes += sig.size;
 												sigList.push_back(sig);
 											}
@@ -362,7 +355,8 @@ static void XMLCALL endElement(PVOID parm, LPCSTR name)
 								msg("** Failed to parse signature! Title: \"%s\" **\n", sig.title);
 
 							if(sig.title)
-								Heap().Free(sig.title);
+								free(sig.title);
+							sig.title = NULL;
 						}
 					}
 					else
@@ -380,7 +374,7 @@ static void XMLCALL endElement(PVOID parm, LPCSTR name)
 	}
 	CATCH();
 }
-//
+
 static BOOL loadSignatures()
 {
 	BOOL result = FALSE;
@@ -420,7 +414,7 @@ static BOOL loadSignatures()
 								if(XML_Parse(p, textStr, lSize, 1) != XML_STATUS_ERROR)
 								{
 									result = (xmlValueBufferSize > 0);
-									sigDataBytes += (sigList.size() * sizeof(SIG));
+									sigDataBytes += (UINT) (sigList.size() * sizeof(SIG));
 								}
 								else
 									msg("** Signature XML parse error: \"%s\" at line #%u! **\n", XML_ErrorString(XML_GetErrorCode(p)), XML_GetCurrentLineNumber(p));
@@ -429,11 +423,13 @@ static BOOL loadSignatures()
 							}
 						}
 
-						Heap().Free(xmlValueStr);
+						free(xmlValueStr);
+						xmlValueStr = NULL;
 					}
 
 					xmlValueBufferSize = 0;
-					Heap().Free(textStr);
+					free(textStr);
+					textStr = NULL;
 				}
 
 			}
@@ -453,12 +449,12 @@ static void freeSignatureData()
 {
 	if(!sigList.empty())
 	{
-		UINT count = sigList.size();
+		UINT count = (UINT) sigList.size();
 		LPSIG e = &sigList[0];
 		do
 		{
-			if(e->title) Heap().Free(e->title);
-			if(e->data)  Heap().Free(e->data);
+			if(e->title) free(e->title);
+			if(e->data)  free(e->data);
 			e++, --count;
 		}while(count);
 
@@ -466,8 +462,8 @@ static void freeSignatureData()
 	}
 }
 
-static void idaapi forumBtnHandler(TView *fields[], int code){ open_url("http://www.macromonkey.com/bb/index.php/topic,22.0.html"); }
-static void idaapi luigiBtnHandler(TView *fields[], int code){ open_url("http://aluigi.org/mytoolz.htm#signsrch"); }
+static void idaapi forumBtnHandler(int button_code, form_actions_t &fa){ open_url("http://www.macromonkey.com/bb/index.php/topic,22.0.html"); }
+static void idaapi luigiBtnHandler(int button_code, form_actions_t &fa){ open_url("http://aluigi.org/mytoolz.htm#signsrch"); }
 
 // Process a segment for signatures
 extern UINT patternSearch(PBYTE, int, PBYTE, int, int);
@@ -476,8 +472,9 @@ static UINT  pageBufferSize = 0;
 
 static void clearProcessSegmentBuffer()
 {
-	if(pageBuffer) Heap().Free(pageBuffer);
-	pageBuffer     = NULL;
+	if(pageBuffer)
+		free(pageBuffer);
+	pageBuffer = NULL;
 	pageBufferSize = 0;
 }
 
@@ -489,8 +486,9 @@ static void clearMatchData()
 static UINT processSegment(segment_t *segPtr)
 {
 	UINT matches = 0;
+	UINT size = (UINT)segPtr->size();
 
-	if(UINT size = (UINT) segPtr->size())
+	if(size)
 	{
 		if(!pageBuffer)
 		{
@@ -519,11 +517,10 @@ static UINT processSegment(segment_t *segPtr)
 		}
 
 		// Copy speed appears to be constant regardless of what accessor
-		// 7-10-2012 About .3 seconds for every 7mb
 		// Note: Padded bytes (that don't exist in the source?) will be all 0xFF
 		{
-			ea_t  currentEa = segPtr->startEA;
-			ea_t  endEa     = segPtr->endEA;
+			ea_t  currentEa = segPtr->start_ea;
+			ea_t  endEa     = segPtr->end_ea;
 			PBYTE buffer    = pageBuffer;
 			UINT  count     = size;
 
@@ -532,19 +529,13 @@ static UINT processSegment(segment_t *segPtr)
 				*buffer = get_db_byte(currentEa);
 				++currentEa, ++buffer, --count;
 
-			}while(count);
-
-			//DumpData(pPageBuffer, 256);
-			//DumpData(pPageBuffer + (uSize - 256), 256);
+			} while(count);
 		}
 
 		// Scan signatures
 		{
-			// 7-10-2012 about 2 seconds per 6.5mb
-			UINT  count  = sigList.size();
-			LPSIG e      = &sigList[0];
-            char name[64]; name[0] = name[SIZESTR(name)] = 0;
-			get_true_segm_name(segPtr, name, SIZESTR(name));
+			UINT  count = (UINT) sigList.size();
+			LPSIG e = &sigList[0];
 
 			for(UINT i = 0; i < count; i++, e++)
 			{
@@ -553,46 +544,39 @@ static UINT processSegment(segment_t *segPtr)
 				{
 					// Get item address points too for code addresses
 					// TOOD: Is there ever data cases too?
-					ea_t address = get_item_head(segPtr->startEA + offset);
-					//msg("Match %08X \"%s\"\n", eaAddress, e->pszTitle);
+					ea_t address = get_item_head(segPtr->start_ea + (ea_t) offset);
+					//msg("Match " EAFORMAT " \"%s\"\n", address, e->title);
 
 					// Optional output to debug channel
 					if(debugOutput)
                         trace(EAFORMAT" \"%s\"\n", address, e->title);
 
-					// Optional place comment
+					// Optionally place informational comment
 					if(placeComments)
 					{
-						const char prefix[] = {"<$ignsrch> "};
-						char comment[MAXSTR]; comment[0] = comment[SIZESTR(comment)] = 0;
+						const char CMTTAG[] = {"#Signsrch "};
 
 						// Already has one?
-						int size = get_cmt(address, TRUE, comment, SIZESTR(comment));
+						qstring comment;
+						int size = (int) get_cmt(&comment, address, TRUE);
 						if(size > 0)
 						{
-							// Skip if already Signsrch comment
-							if((size > sizeof(prefix)) && (strstr(comment, prefix) != NULL))
+							// Skip if already has Signsrch comment
+							if ((size > sizeof(CMTTAG)) && (comment.find(CMTTAG) != qstring::npos))
 								size = -1;
 
 							if(size != -1)
 							{
-								// Skip if not enough space
-								if((size + strlen(e->title) + sizeof("\n")) >= SIZESTR(comment))
-									size = -1;
-
-								if(size != -1)
+								// If large string add a line break, else just a space to separate them
+								if(size >= 54)
 								{
-									// If big add a line break, else just a space
-									if(size >= 54)
-									{
-										strcpy(comment + size, "\n");
-										size += SIZESTR("\n");
-									}
-									else
-									{
-										comment[size] = ' ';
-										size += SIZESTR(" ");
-									}
+									comment.append('\n');
+									size += SIZESTR("\n");
+								}
+								else
+								{
+									comment.append(' ');
+									size += SIZESTR(" ");
 								}
 							}
 						}
@@ -601,8 +585,13 @@ static UINT processSegment(segment_t *segPtr)
 
 						if(size >= 0)
 						{
-							sprintf(comment + size, "%s\"%s\" ", prefix, e->title);
-							set_cmt(address, comment, TRUE);
+							char buffer[MAXSTR];
+							if(comment.empty())
+								_snprintf_s(buffer, sizeof(buffer), SIZESTR(buffer), "%s\"%s\" ", CMTTAG, e->title);
+							else
+								_snprintf_s(buffer, sizeof(buffer), SIZESTR(buffer), "%s%s\"%s\" ", comment.c_str(), CMTTAG, e->title);
+
+							set_cmt(address, buffer, TRUE);
 						}
 					}
 
@@ -623,95 +612,106 @@ static UINT processSegment(segment_t *segPtr)
 
 
 // ============================================================================
-// Matches list window stuff
-static const LPCSTR columnHeader[] =
+// Signature list view chooser
+class list_chooser : public chooser_multi_t
 {
-	"Address",
-	"Size",
-	"Label",
+	static const int _widths[3];
+	static const char *_header[3];
+	static const char _title[];
+
+public:
+	list_chooser() : chooser_multi_t(CH_QFTYP_DEFAULT, _countof(_header), _widths, _header, _title)
+	{
+		#ifdef __EA64__
+		// Setup hex address display to the minimal size needed plus a leading zero
+		ea_t largest = 0;
+		for (auto it = matchList.begin(); it != matchList.end(); ++it)
+		{
+			if (it->address > largest)
+				largest = it->address;
+		}
+
+		char buffer[32];
+		int digits = (int) strlen(_ui64toa(largest, buffer, 16));
+		if (++digits > 16) digits = 16;
+		sprintf_s(addressFormat, sizeof(buffer), "%%s:%%0%uI64X", digits);
+		#endif
+
+		// Custom chooser icon
+		icon = iconID;
+	}
+
+	virtual void closed()
+	{
+		// Clean up
+		clearMatchData();
+		clearPatternSearchData();
+		freeSignatureData();
+		listChooserUp = FALSE;
+	}
+
+	virtual const void *get_obj_id(size_t *len) const
+	{
+		*len = strlen(title);
+		return title;
+	}
+
+	virtual size_t get_count() const { return (size_t) matchList.size(); }
+
+	virtual cbres_t enter(sizevec_t *sel)
+	{
+		size_t n = sel->front();
+		if (n < get_count())
+			jumpto(matchList[n].address);
+		return NOTHING_CHANGED;
+	}
+
+	virtual void get_row(qstrvec_t *cols_, int *icon_, chooser_item_attrs_t *attributes, size_t n) const
+	{
+		try
+		{
+			qstrvec_t &cols = *cols_;
+
+			ea_t address = matchList[n].address;
+			qstring name("unknown");
+			get_segm_name(&name, getseg(address));
+			#ifdef __EA64__
+			cols[0].sprnt(addressFormat, name.c_str(), address);
+			#else
+			cols[0].sprnt("%s:" EAFORMAT, name.c_str(), address);
+			#endif
+
+			cols[1].sprnt("%04X", sigList[matchList[n].index].size);
+			cols[2] = sigList[matchList[n].index].title;
+
+			*icon_ = -1;
+		}
+		CATCH()
+	}
+
+private:
+	#ifdef __EA64__
+	char addressFormat[16];
+	#endif
 };
-const int LBCOLUMNCOUNT = (sizeof(columnHeader) / sizeof(LPCSTR));
-static int aListBColumnWidth[LBCOLUMNCOUNT] = {15, 4, 52}; // (9 | CHCOL_HEX)
 
-UINT CALLBACK LB_onGetLineCount(PVOID parm)
+const char list_chooser::_title[] = { "[ Signsrch matches ]" };
+const char *list_chooser::_header[3] = { "Address",	"Size", "Label" };
+const int list_chooser::_widths[3] = { 12, 3, 100 };
+
+// ============================================================================
+
+
+static bool idaapi run(size_t arg)
 {
-	return(matchList.size());
-}
-
-void CALLBACK LB_onMakeLine(PVOID parm, UINT n, char * const *cellPtr)
-{
-	try
-	{
-		// Set column header labels
-		if(n == 0)
-		{
-			for(UINT i = 0; i < LBCOLUMNCOUNT; i++)
-				strcpy(cellPtr[i], columnHeader[i]);
-		}
-		else
-		// Set line strings
-		{
-			ea_t address = matchList[n - 1].address;
-			if(segment_t *seg = getseg(address))
-			{
-				char name[64]; name[SIZESTR(name)] = 0;
-				get_true_segm_name(seg, name, SIZESTR(name));
-                sprintf(cellPtr[0], "%s:" EAFORMAT, name, address);
-			}
-			else
-                sprintf(cellPtr[0], "unknown:" EAFORMAT, address);
-			//sprintf(ppCell[0], EAFORMAT, MatchList[n - 1].eaAddress);
-
-			sprintf(cellPtr[1], "%04X", sigList[matchList[n - 1].index].size);
-			strcpy(cellPtr[2], sigList[matchList[n - 1].index].title);
-		}
-	}
-	CATCH()
-}
-
-// No icon
-int CALLBACK LB_getIcon(PVOID parm, uint32 n)
-{
-    return(-1);
-}
-
-
-void CALLBACK LB_onSelect(PVOID parm, UINT n)
-{
-	try
-	{
-		jumpto(matchList[n - 1].address);
-	}
-	CATCH()
-}
-
-void CALLBACK LB_onClose(PVOID parm)
-{
-    if (iconID != -1)
-    {
-        free_custom_icon(iconID);
-        iconID = -1;
-    }
-
-	// Clean up
-	clearMatchData();
-	clearPatternSearchData();
-	freeSignatureData();
-	listWindowUp = FALSE;
-}
-
-
-static void idaapi pluginRun(int arg)
-{
-	if(!listWindowUp)
+	if(!listChooserUp)
 	{
         char version[16];
         sprintf(version, "%u.%u", HIBYTE(MY_VERSION), LOBYTE(MY_VERSION));
         msg("\n>> IDA Signsrch plugin: v: %s, BD: %s, By Sirmabus\n", version, __DATE__);
-		GetModuleHandleEx((GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS), (LPCTSTR) &pluginRun, &myModule);
-        refreshUI();
+		GetModuleHandleEx((GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS), (LPCTSTR) &run, &myModule);
 
-		if(autoIsOk())
+		if(auto_is_ok())
 		{
 			// Currently we only supports8bit byte processors
 			if((ph.cnbits != 8) || (ph.dnbits != 8))
@@ -719,7 +719,7 @@ static void idaapi pluginRun(int arg)
 				msg("** Sorry only 8bit byte processors are currently supported **\n");
 				msg("  The processor for this IDB is %d bit code and %d bit data.\n  Please report this issue on the IDA Signsrch support forum.\n", ph.cnbits, ph.dnbits);
 				msg("** Aborted **\n\n");
-				return;
+				return FALSE;
 			}
 
 			// Do main dialog
@@ -727,29 +727,28 @@ static void idaapi pluginRun(int arg)
 			debugOutput	        = FALSE;
 			includeCodeSegments = TRUE;
 			placeComments       = TRUE;
-			WORD optionFlags = 0;
-			if(altEndianSearch)     optionFlags |= OPT_ALTENDIAN;
-			if(debugOutput)		    optionFlags |= OPT_DEBUGOUT;
-			if(includeCodeSegments) optionFlags |= OPT_CODESEGS;
-			if(placeComments)       optionFlags |= OPT_COMMENTS;
+			WORD options = 0;
+			if(altEndianSearch)     options |= OPT_ALTENDIAN;
+			if(debugOutput)		    options |= OPT_DEBUGOUT;
+			if(includeCodeSegments) options |= OPT_CODESEGS;
+			if(placeComments)       options |= OPT_COMMENTS;
 
-            int uiResult = AskUsingForm_c(mainForm, version, __DATE__, &optionFlags, forumBtnHandler, luigiBtnHandler);
+            int uiResult = ask_form(mainForm, version, __DATE__, &options, forumBtnHandler, luigiBtnHandler);
 			if(!uiResult)
 			{
 				// User canceled, or no options selected, bail out
 				msg(" - Canceled -\n");
-				return;
+				return FALSE;
 			}
 
-			altEndianSearch     = ((optionFlags & OPT_ALTENDIAN) != 0);
-			debugOutput		    = ((optionFlags & OPT_DEBUGOUT) != 0);
-			includeCodeSegments = ((optionFlags & OPT_CODESEGS) != 0);
-			placeComments       = ((optionFlags & OPT_COMMENTS) != 0);
+			altEndianSearch     = ((options & OPT_ALTENDIAN) != 0);
+			debugOutput		    = ((options & OPT_DEBUGOUT) != 0);
+			includeCodeSegments = ((options & OPT_CODESEGS) != 0);
+			placeComments       = ((options & OPT_COMMENTS) != 0);
 
             WaitBox::show("Signsrch");
             WaitBox::updateAndCancelCheck(-1);
-			msg("IDB: %s endian.\n", ((inf.mf == 0) ? "Little" : "Big"));
-            refreshUI();
+			msg("IDB: %s endian.\n", (inf.is_be() ? "Big" : "Little"));
 
 			TIMESTAMP startTime = getTimeStamp();
 			if(loadSignatures())
@@ -757,7 +756,6 @@ static void idaapi pluginRun(int arg)
                 BOOL aborted = FALSE;
 				char numBuffer[32];
 				msg("%s signatures loaded, size: %s.\n\n", prettyNumberString(sigList.size(), numBuffer), byteSizeString(sigDataBytes));
-                refreshUI();
 
 				// Typical matches less then 200, and this is small
 				matchList.reserve(256);
@@ -770,14 +768,14 @@ static void idaapi pluginRun(int arg)
 					int count = get_segm_qty();
 					for(int i = 0; (i < count) && !aborted; i++)
 					{
-						if(segment_t *seg = getnseg(i))
+						if(segment_t *segPtr = getnseg(i))
 						{
-							char name[64] = {0};
-							get_true_segm_name(seg, name, SIZESTR(name));
-							char classStr[16] = {0};
-							get_segm_class(seg, classStr, SIZESTR(classStr));
+							qstring name;
+							get_segm_name(&name, segPtr);
+							qstring classStr;
+							get_segm_class(&classStr, segPtr);
 
-							switch(seg->type)
+							switch(segPtr->type)
 							{
 								// Types to skip
 								case SEG_XTRN:
@@ -788,22 +786,22 @@ static void idaapi pluginRun(int arg)
 								case SEG_COMM:
 								case SEG_IMEM:
 								case SEG_CODE:
-								if(!((seg->type == SEG_CODE) && includeCodeSegments))
+								if(!((segPtr->type == SEG_CODE) && includeCodeSegments))
 								{
-                                    msg("Skipping segment: \"%s\", \"%s\", %d, " EAFORMAT " - " EAFORMAT ", %s\n", name, classStr, seg->type, seg->startEA, seg->endEA, byteSizeString(seg->size()));
+                                    msg("Skipping: \"%s\", \"%s\", %d, " EAFORMAT " - " EAFORMAT ", %s\n", name.c_str(), classStr.c_str(), segPtr->type, segPtr->start_ea, segPtr->end_ea, byteSizeString(segPtr->size()));
 									break;
 								}
 
 								default:
 								{
-                                    msg("Processing segment: \"%s\", \"%s\", %d, " EAFORMAT " - " EAFORMAT ", %s\n", name, classStr, seg->type, seg->startEA, seg->endEA, byteSizeString(seg->size()));
-									UINT matches = processSegment(seg);
+                                    msg("Segment: \"%s\", \"%s\", %d, " EAFORMAT " - " EAFORMAT ", %s\n", name.c_str(), classStr.c_str(), segPtr->type, segPtr->start_ea, segPtr->end_ea, byteSizeString(segPtr->size()));
+									UINT matches = processSegment(segPtr);
 									if(matches> 0)
 									{
 										if(matches != -1)
 										{
 											totalMatches += matches;
-											msg("%u matches here.\n", matches);
+											msg("  %u matches here.\n", matches);
 										}
 										else
 											aborted = TRUE;
@@ -813,7 +811,6 @@ static void idaapi pluginRun(int arg)
 							};
 						}
 					}
-                    refreshUI();
 
 					// Sort match list by address
 					if(!aborted)
@@ -830,32 +827,14 @@ static void idaapi pluginRun(int arg)
 					msg("\nDone: Found %u matches in %s.\n\n", totalMatches, timeString(getTimeStamp() - startTime));
                     if (debugOutput)
                         trace("%u signature matches.\n", totalMatches);
-                    refreshUI();
 
 					if(!matchList.empty())
 					{
                         if (iconID == -1)
                             iconID = load_custom_icon(iconData, sizeof(iconData), "png");
 
-						// Create list view window
-						listWindowUp = !choose2(0,	// Non-modal window
-							-1, -1, -1, -1,			// Window position
-							&matchList,				// Pass data
-							LBCOLUMNCOUNT,			// Number of columns
-							aListBColumnWidth,		// Widths of columns
-							LB_onGetLineCount,		// Function that returns number of lines
-							LB_onMakeLine,  		// Function that generates a line
-							"[ Signsrch matches ]",	// Window title
-                            iconID,					// Icon for the window
-							0,						// Starting line
-							NULL,					// "kill" callback
-							NULL,					// "new" callback
-							NULL,					// "update" callback
-							NULL,					// "edit" callback
-							LB_onSelect,			// Function to call when the user pressed Enter
-							LB_onClose,				// Function to call when the window is closed
-							NULL,					// Popup menu items
-							LB_getIcon);  			// Line icon function
+						list_chooser *chooserPtr = new list_chooser();
+						listChooserUp = (chooserPtr->choose() == 0);
 					}
 					else
 					{
@@ -881,5 +860,7 @@ static void idaapi pluginRun(int arg)
 	}
 	else
 		PlaySound((LPCSTR) SND_ALIAS_SYSTEMEXCLAMATION, NULL, (SND_ALIAS_ID | SND_ASYNC));
+
+	return TRUE;
 }
 
